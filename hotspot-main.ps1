@@ -217,81 +217,131 @@ function Wait-AndStartNetworkServices {
     return $false
 }
 
-# Function to enable hotspot (compatible with all versions)
+# Function to enable hotspot with retry mechanism (compatible with all versions)
 function Enable-Hotspot {
-    try {
-        Write-Log "Loading Windows Runtime assemblies..."
+    param(
+        [int]$MaxRetries = 10,
+        [int]$RetryDelay = 5
+    )
+    
+    $attempt = 0
+    $success = $false
+    
+    while ($attempt -lt $MaxRetries -and -not $success) {
+        $attempt++
+        Write-Log "Attempt $attempt/$MaxRetries to enable hotspot..."
         
-        # Load Windows Runtime assemblies (compatible way)
-        Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction Stop
-        
-        # Load Windows Runtime types
-        [Windows.System.UserProfile.LockScreen, Windows.System.UserProfile, ContentType = WindowsRuntime] | Out-Null
-        [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType = WindowsRuntime] | Out-Null
-        [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType = WindowsRuntime] | Out-Null
-        
-        Write-Log "Windows Runtime assemblies loaded successfully"
-        
-        # Get the AsTask generic method
-        $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { 
-            $_.Name -eq 'AsTask' -and 
-            $_.GetParameters().Count -eq 1 -and 
-            $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' 
-        })[0]
-        
-        # Await function for async operations
-        Function Await($WinRtTask, $ResultType) {
-            $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
-            $netTask = $asTask.Invoke($null, @($WinRtTask))
-            $netTask.Wait(-1) | Out-Null
-            $netTask.Result
-        }
+        try {
+            Write-Log "Loading Windows Runtime assemblies..."
+            
+            # Load Windows Runtime assemblies (compatible way)
+            Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction Stop
+            
+            # Load Windows Runtime types
+            [Windows.System.UserProfile.LockScreen, Windows.System.UserProfile, ContentType = WindowsRuntime] | Out-Null
+            [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType = WindowsRuntime] | Out-Null
+            [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType = WindowsRuntime] | Out-Null
+            
+            Write-Log "Windows Runtime assemblies loaded successfully"
+            
+            # Get the AsTask generic method
+            $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { 
+                $_.Name -eq 'AsTask' -and 
+                $_.GetParameters().Count -eq 1 -and 
+                $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' 
+            })[0]
+            
+            # Await function for async operations
+            Function Await($WinRtTask, $ResultType) {
+                $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
+                $netTask = $asTask.Invoke($null, @($WinRtTask))
+                $netTask.Wait(-1) | Out-Null
+                $netTask.Result
+            }
 
-        Write-Log "Getting connection profile..."
-        # Get connection profile and tethering manager
-        $connectionProfile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
-        if (-not $connectionProfile) {
-            Write-Log "No internet connection profile found, trying to get any network profile..." "WARN"
-            # Try to get any network profile
-            $profiles = [Windows.Networking.Connectivity.NetworkInformation]::GetConnectionProfiles()
-            if ($profiles.Count -gt 0) {
-                $connectionProfile = $profiles[0]
-                Write-Log "Using first available network profile: $($connectionProfile.ProfileName)"
+            Write-Log "Getting connection profile..."
+            # Get connection profile and tethering manager
+            $connectionProfile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
+            if (-not $connectionProfile) {
+                Write-Log "No internet connection profile found, trying to get any network profile..." "WARN"
+                # Try to get any network profile
+                $profiles = [Windows.Networking.Connectivity.NetworkInformation]::GetConnectionProfiles()
+                if ($profiles.Count -gt 0) {
+                    $connectionProfile = $profiles[0]
+                    Write-Log "Using first available network profile: $($connectionProfile.ProfileName)"
+                } else {
+                    Write-Log "No network profiles found" "ERROR"
+                    throw "No network profiles available"
+                }
+            }
+            
+            $tetheringManager = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($connectionProfile)
+            
+            # Check current status
+            $status = $tetheringManager.TetheringOperationalState
+            Write-Log "Current hotspot status: $status"
+            
+            if ($status -eq "On") {
+                Write-Log "Hotspot is already enabled"
+                $success = $true
+                break
+            }
+            
+            Write-Log "Starting Mobile Hotspot..."
+            # Start Mobile Hotspot
+            $result = Await ($tetheringManager.StartTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
+            
+            if ($result.Status -eq "Success") {
+                Write-Log "WiFi hotspot enabled successfully at system startup!" "SUCCESS"
+                $success = $true
+                break
             } else {
-                Write-Log "No network profiles found" "ERROR"
-                return $false
+                Write-Log "Failed to enable WiFi hotspot: $($result.Status)" "ERROR"
+                if ($result.AdditionalErrorMessage) {
+                    Write-Log "Additional error: $($result.AdditionalErrorMessage)" "ERROR"
+                }
+                throw "Hotspot enablement failed: $($result.Status)"
+            }
+        } catch {
+            Write-Log "Error enabling hotspot (attempt $attempt): $_" "ERROR"
+            
+            if ($attempt -lt $MaxRetries) {
+                Write-Log "Waiting $RetryDelay seconds before retry..."
+                Start-Sleep -Seconds $RetryDelay
             }
         }
-        
-        $tetheringManager = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($connectionProfile)
-        
-        # Check current status
-        $status = $tetheringManager.TetheringOperationalState
-        Write-Log "Current hotspot status: $status"
-        
-        if ($status -eq "On") {
-            Write-Log "Hotspot is already enabled"
-            return $true
-        }
-        
-        Write-Log "Starting Mobile Hotspot..."
-        # Start Mobile Hotspot
-        $result = Await ($tetheringManager.StartTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
-        
-        if ($result.Status -eq "Success") {
-            Write-Log "WiFi hotspot enabled successfully at system startup!" "SUCCESS"
-            return $true
-        } else {
-            Write-Log "Failed to enable WiFi hotspot: $($result.Status)" "ERROR"
-            if ($result.AdditionalErrorMessage) {
-                Write-Log "Additional error: $($result.AdditionalErrorMessage)" "ERROR"
-            }
-            return $false
-        }
-    } catch {
-        Write-Log "Error enabling hotspot: $_" "ERROR"
+    }
+    
+    if ($success) {
+        Write-Log "Hotspot enabled successfully after $attempt attempt(s)" "SUCCESS"
+        return $true
+    } else {
+        Write-Log "Failed to enable hotspot after $MaxRetries attempts" "ERROR"
         return $false
     }
+}
+
+# Main execution
+try {
+    Write-Log "Starting hotspot enablement process..."
+    
+    # Wait for and start network services
+    if (Wait-AndStartNetworkServices) {
+        # Wait a bit more for services to fully initialize
+        Write-Log "Waiting for services to fully initialize..."
+        Start-Sleep -Seconds 15
+        
+        # Enable hotspot with retry mechanism
+        if (Enable-Hotspot -MaxRetries 10 -RetryDelay 5) {
+            Write-Log "Hotspot enablement process completed successfully" "SUCCESS"
+        } else {
+            Write-Log "Hotspot enablement failed after all retries" "ERROR"
+        }
+    } else {
+        Write-Log "Network services not ready, skipping hotspot enablement" "ERROR"
+    }
+} catch {
+    Write-Log "Unexpected error: $_" "ERROR"
 }
 
 # Main execution
